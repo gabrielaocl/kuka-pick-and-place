@@ -1,0 +1,312 @@
+# =========================
+# CUSTOM PYTORCH TRAINER
+# learns: which cube to pick next
+# classes: 0=red, 1=white, 2=blue
+# =========================
+
+!pip install torch -q
+
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# -------------------------
+# Reproducibility
+# -------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("device:", device)
+
+# -------------------------
+# Expert policy
+# Current symbolic policy:
+# pick red first, then white, then blue
+# if unavailable, pick next available
+# -------------------------
+COLOR_TO_INDEX = {"red": 0, "white": 1, "blue": 2}
+INDEX_TO_COLOR = {0: "red", 1: "white", 2: "blue"}
+
+def expert_policy(obs_vec):
+    """
+    obs_vec format:
+    [red_x, red_y, red_z, red_avail,
+     white_x, white_y, white_z, white_avail,
+     blue_x, blue_y, blue_z, blue_avail,
+     stack_height]
+    """
+    red_avail   = int(obs_vec[3])
+    white_avail = int(obs_vec[7])
+    blue_avail  = int(obs_vec[11])
+
+    if red_avail:
+        return 0
+    if white_avail:
+        return 1
+    if blue_avail:
+        return 2
+    return 0  # fallback; shouldn't happen in dataset
+
+# -------------------------
+# Synthetic demonstration generator
+# This mirrors your world structure:
+# one robot sees 3 local cubes and current stack height
+# -------------------------
+def generate_single_demo():
+    # local cube positions with slight noise
+    # robot-local arrangement: left, center, right
+    # red, white, blue are fixed color identities here
+    red_pos = np.array([-0.14, 0.76, 0.03]) + np.random.normal(0, 0.01, 3)
+    white_pos = np.array([0.00, 0.76, 0.03]) + np.random.normal(0, 0.01, 3)
+    blue_pos = np.array([0.14, 0.76, 0.03]) + np.random.normal(0, 0.01, 3)
+
+    # random episode progress:
+    # stack height tells us how many cubes already placed
+    stack_height = random.choice([0, 1, 2])
+
+    # availability pattern consistent with expert ordering
+    # height 0 -> all available
+    # height 1 -> red gone
+    # height 2 -> red, white gone
+    if stack_height == 0:
+        red_avail, white_avail, blue_avail = 1, 1, 1
+    elif stack_height == 1:
+        red_avail, white_avail, blue_avail = 0, 1, 1
+    else:
+        red_avail, white_avail, blue_avail = 0, 0, 1
+
+    obs = np.array([
+        red_pos[0], red_pos[1], red_pos[2], red_avail,
+        white_pos[0], white_pos[1], white_pos[2], white_avail,
+        blue_pos[0], blue_pos[1], blue_pos[2], blue_avail,
+        float(stack_height)
+    ], dtype=np.float32)
+
+    target = expert_policy(obs)
+    return obs, target
+
+def generate_dataset(n_samples=4000):
+    X, y = [], []
+    for _ in range(n_samples):
+        obs, target = generate_single_demo()
+        X.append(obs)
+        y.append(target)
+    return np.stack(X), np.array(y, dtype=np.int64)
+
+X, y = generate_dataset(n_samples=5000)
+
+# train / val split
+perm = np.random.permutation(len(X))
+split = int(0.8 * len(X))
+train_idx = perm[:split]
+val_idx = perm[split:]
+
+X_train, y_train = X[train_idx], y[train_idx]
+X_val, y_val = X[val_idx], y[val_idx]
+
+print("train:", X_train.shape, y_train.shape)
+print("val:  ", X_val.shape, y_val.shape)
+
+# -------------------------
+# Dataset / DataLoader
+# -------------------------
+class CubeDecisionDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_ds = CubeDecisionDataset(X_train, y_train)
+val_ds = CubeDecisionDataset(X_val, y_val)
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
+
+# -------------------------
+# Model
+# input dim = 13
+# output dim = 3 classes
+# -------------------------
+class CubePolicyNet(nn.Module):
+    def __init__(self, input_dim=13, hidden_dim=64, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = CubePolicyNet().to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# -------------------------
+# Train / eval
+# -------------------------
+def run_epoch(model, loader, optimizer=None):
+    train_mode = optimizer is not None
+    model.train(train_mode)
+
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        logits = model(xb)
+        loss = criterion(logits, yb)
+
+        if train_mode:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        preds = torch.argmax(logits, dim=1)
+        total_loss += loss.item() * xb.size(0)
+        total_correct += (preds == yb).sum().item()
+        total_count += xb.size(0)
+
+    return total_loss / total_count, total_correct / total_count
+
+# -------------------------
+# Custom trainer loop
+# -------------------------
+num_epochs = 20
+best_val_acc = 0.0
+best_state = None
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = run_epoch(model, train_loader, optimizer=optimizer)
+    val_loss, val_acc = run_epoch(model, val_loader, optimizer=None)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    print(
+        f"epoch {epoch:02d} | "
+        f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+        f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+    )
+
+print("best_val_acc:", round(best_val_acc, 4))
+
+# restore best checkpoint
+if best_state is not None:
+    model.load_state_dict(best_state)
+
+# -------------------------
+# Inference helper
+# Plug this into your PyBullet agent
+# -------------------------
+@torch.no_grad()
+def predict_next_cube(obs_vec):
+    """
+    obs_vec shape: (13,)
+    returns:
+      class_idx: 0/1/2
+      color_name: red/white/blue
+      probs: numpy array shape (3,)
+    """
+    x = torch.tensor(obs_vec, dtype=torch.float32, device=device).unsqueeze(0)
+    logits = model(x)
+    probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+    class_idx = int(np.argmax(probs))
+    return class_idx, INDEX_TO_COLOR[class_idx], probs
+
+# -------------------------
+# Quick sanity check
+# -------------------------
+test_obs = np.array([
+    -0.14, 0.76, 0.03, 1,   # red available
+     0.00, 0.76, 0.03, 1,   # white available
+     0.14, 0.76, 0.03, 1,   # blue available
+     0.0                    # stack height
+], dtype=np.float32)
+
+pred_idx, pred_color, pred_probs = predict_next_cube(test_obs)
+print("prediction:", pred_idx, pred_color, pred_probs)
+
+# -------------------------
+# How to use in your agent:
+# Replace your symbolic decide() with model-based decide()
+# -------------------------
+def learned_decide(observation):
+    """
+    observation format expected:
+      {
+        'available_blocks': [
+            {'color': 'red', 'pick_pos': [...], 'id': ...},
+            {'color': 'white', ...},
+            {'color': 'blue', ...}
+        ],
+        'stack_height': int
+      }
+    """
+    # default placeholders
+    color_to_block = {"red": None, "white": None, "blue": None}
+    for block in observation["available_blocks"]:
+        color_to_block[block["color"]] = block
+
+    def encode_block(block):
+        if block is None:
+            return [0.0, 0.0, 0.0, 0.0]
+        return [
+            float(block["pick_pos"][0]),
+            float(block["pick_pos"][1]),
+            float(block["pick_pos"][2]),
+            1.0
+        ]
+
+    obs_vec = np.array(
+        encode_block(color_to_block["red"]) +
+        encode_block(color_to_block["white"]) +
+        encode_block(color_to_block["blue"]) +
+        [float(observation["stack_height"])],
+        dtype=np.float32
+    )
+
+    pred_idx, pred_color, pred_probs = predict_next_cube(obs_vec)
+    chosen_block = color_to_block[pred_color]
+
+    # fallback in case model picks unavailable color
+    if chosen_block is None:
+        for color_name in ["red", "white", "blue"]:
+            if color_to_block[color_name] is not None:
+                chosen_block = color_to_block[color_name]
+                pred_color = color_name
+                break
+
+    if chosen_block is None:
+        return {"action": "wait"}
+
+    target_z = 0.05 + 0.06 * observation["stack_height"]
+
+    return {
+        "action": "pick_and_place",
+        "block_id": chosen_block["id"],
+        "pick_pos": chosen_block["pick_pos"],
+        "color": pred_color,
+        "place_pos": [0.0, 1.18, target_z],  # replace per robot/platform as needed
+        "probs": pred_probs,
+    }
+
+print("trainer ready")
