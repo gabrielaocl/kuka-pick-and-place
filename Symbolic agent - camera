@@ -1,0 +1,378 @@
+# =========================
+# USE TRAINED PYTORCH MODEL
+# INSIDE THE PYBULLET AGENT
+# =========================
+
+import pybullet as p
+import pybullet_data
+import numpy as np
+import imageio
+from IPython.display import Video
+
+# -------------------------
+# Reset sim
+# -------------------------
+p.connect(p.DIRECT)
+p.resetSimulation()
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -9.81)
+
+plane_id = p.loadURDF("plane.urdf")
+p.changeVisualShape(plane_id, -1, rgbaColor=[0, 0, 0, 1])
+
+spacing = 1.524
+robot_path = "kuka_iiwa/model.urdf"
+
+robot_positions = [
+    [-spacing, 0.0, 0.0],
+    [0.0,      0.0, 0.0],
+    [spacing,  0.0, 0.0],
+]
+
+robots = []
+for pos in robot_positions:
+    rid = p.loadURDF(
+        robot_path,
+        basePosition=pos,
+        baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
+        useFixedBase=True
+    )
+    robots.append(rid)
+
+# -------------------------
+# Camera / video
+# -------------------------
+CAM_W, CAM_H = 900, 520
+frames = []
+
+def get_rgb_frame():
+    view_matrix = p.computeViewMatrixFromYawPitchRoll(
+        cameraTargetPosition=[0.0, 1.0, 0.12],
+        distance=2.6,
+        yaw=0,
+        pitch=-2,
+        roll=0,
+        upAxisIndex=2
+    )
+
+    proj_matrix = p.computeProjectionMatrixFOV(
+        fov=70,
+        aspect=CAM_W / CAM_H,
+        nearVal=0.1,
+        farVal=100
+    )
+
+    img = p.getCameraImage(
+        width=CAM_W,
+        height=CAM_H,
+        viewMatrix=view_matrix,
+        projectionMatrix=proj_matrix,
+        renderer=p.ER_TINY_RENDERER
+    )
+
+    return np.reshape(img[2], (CAM_H, CAM_W, 4))[:, :, :3]
+
+def capture_frame():
+    frames.append(get_rgb_frame())
+
+# -------------------------
+# Helpers
+# -------------------------
+def get_revolute_joints(robot_id):
+    joints = []
+    for j in range(p.getNumJoints(robot_id)):
+        if p.getJointInfo(robot_id, j)[2] == p.JOINT_REVOLUTE:
+            joints.append(j)
+    return joints
+
+def reset_arm_pose(robot_id, joint_positions):
+    joints = get_revolute_joints(robot_id)
+    for j, q in zip(joints, joint_positions):
+        p.resetJointState(robot_id, j, q)
+
+def step_and_capture(num_steps, capture_every=4):
+    for i in range(num_steps):
+        p.stepSimulation()
+        if i % capture_every == 0:
+            capture_frame()
+
+def move_ee(robot_id, target_pos, steps=90, capture_every=4):
+    joints = get_revolute_joints(robot_id)
+    ee_link = joints[-1]
+    target_orn = p.getQuaternionFromEuler([0, np.pi, 0])
+
+    ik = p.calculateInverseKinematics(
+        robot_id,
+        ee_link,
+        target_pos,
+        targetOrientation=target_orn
+    )
+
+    for i in range(steps):
+        for joint_index, joint_id in enumerate(joints):
+            p.setJointMotorControl2(
+                bodyIndex=robot_id,
+                jointIndex=joint_id,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=ik[joint_index],
+                force=500
+            )
+        p.stepSimulation()
+        if i % capture_every == 0:
+            capture_frame()
+
+def create_colored_block(position, rgba, half_extents=(0.03, 0.03, 0.03), mass=0.12):
+    collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+    visual = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=rgba)
+    return p.createMultiBody(
+        baseMass=mass,
+        baseCollisionShapeIndex=collision,
+        baseVisualShapeIndex=visual,
+        basePosition=position
+    )
+
+def attach_block_to_ee(robot_id, block_id):
+    joints = get_revolute_joints(robot_id)
+    ee_link = joints[-1]
+    ee_state = p.getLinkState(robot_id, ee_link)
+    ee_pos, ee_orn = ee_state[0], ee_state[1]
+
+    p.resetBasePositionAndOrientation(block_id, ee_pos, ee_orn)
+
+    cid = p.createConstraint(
+        parentBodyUniqueId=robot_id,
+        parentLinkIndex=ee_link,
+        childBodyUniqueId=block_id,
+        childLinkIndex=-1,
+        jointType=p.JOINT_FIXED,
+        jointAxis=[0, 0, 0],
+        parentFramePosition=[0, 0, 0.08],
+        childFramePosition=[0, 0, 0]
+    )
+    return cid
+
+def release_block(cid):
+    p.removeConstraint(cid)
+
+def execute_pick_and_place(robot_id, block_id, pick_pos, place_pos):
+    above_pick  = [pick_pos[0],  pick_pos[1],  pick_pos[2]  + 0.30]
+    grab_pick   = [pick_pos[0],  pick_pos[1],  pick_pos[2]  + 0.08]
+    above_place = [place_pos[0], place_pos[1], place_pos[2] + 0.30]
+    set_place   = [place_pos[0], place_pos[1], place_pos[2] + 0.08]
+
+    move_ee(robot_id, above_pick,  steps=80, capture_every=4)
+    move_ee(robot_id, grab_pick,   steps=80, capture_every=4)
+
+    cid = attach_block_to_ee(robot_id, block_id)
+    capture_frame()
+
+    move_ee(robot_id, above_pick,  steps=80, capture_every=4)
+    move_ee(robot_id, above_place, steps=100, capture_every=4)
+    move_ee(robot_id, set_place,   steps=80, capture_every=4)
+
+    release_block(cid)
+    step_and_capture(35, capture_every=2)
+    move_ee(robot_id, above_place, steps=70, capture_every=4)
+
+# -------------------------
+# Home pose
+# -------------------------
+home_q = [0, 0.4, 0, -1.6, 0, 1.2, 0]
+for rid in robots:
+    reset_arm_pose(rid, home_q)
+
+step_and_capture(60, capture_every=4)
+
+# -------------------------
+# Platforms
+# -------------------------
+platform_positions = [
+    [-spacing, 1.18, 0.02],
+    [0.0,      1.18, 0.02],
+    [spacing,  1.18, 0.02],
+]
+
+for pos in platform_positions:
+    platform_collision = p.createCollisionShape(
+        p.GEOM_BOX,
+        halfExtents=[0.11, 0.11, 0.02]
+    )
+    platform_visual = p.createVisualShape(
+        p.GEOM_BOX,
+        halfExtents=[0.11, 0.11, 0.02],
+        rgbaColor=[0.35, 0.35, 0.35, 1]
+    )
+    p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=platform_collision,
+        baseVisualShapeIndex=platform_visual,
+        basePosition=pos
+    )
+
+# -------------------------
+# Blocks
+# -------------------------
+color_defs = [
+    ("red",   [1, 0, 0, 1]),
+    ("white", [1, 1, 1, 1]),
+    ("blue",  [0, 0, 1, 1]),
+]
+
+blocks = []
+
+for robot_index, (base_x, _, _) in enumerate(robot_positions):
+    cube_positions = [
+        [base_x - 0.14, 0.76, 0.03],
+        [base_x,        0.76, 0.03],
+        [base_x + 0.14, 0.76, 0.03],
+    ]
+    for cube_pos, (color_name, rgba) in zip(cube_positions, color_defs):
+        cube_id = create_colored_block(cube_pos, rgba)
+        blocks.append({
+            "id": cube_id,
+            "color": color_name,
+            "pick_pos": cube_pos,
+            "owner": robot_index,
+            "assigned": False,
+            "stacked": False,
+        })
+
+step_and_capture(80, capture_every=4)
+
+# -------------------------
+# Learned agent
+# Requires model, predict_next_cube from previous trainer cell
+# -------------------------
+class LearnedRobotAgent:
+    def __init__(self, name, robot_id, owner_index, stack_x, stack_y):
+        self.name = name
+        self.robot_id = robot_id
+        self.owner_index = owner_index
+        self.stack_x = stack_x
+        self.stack_y = stack_y
+        self.done = False
+
+    def observe(self, world_blocks, current_stack_height):
+        my_blocks = [
+            b for b in world_blocks
+            if b["owner"] == self.owner_index and not b["assigned"] and not b["stacked"]
+        ]
+
+        color_to_block = {"red": None, "white": None, "blue": None}
+        for block in my_blocks:
+            color_to_block[block["color"]] = block
+
+        return {
+            "available_blocks": my_blocks,
+            "color_to_block": color_to_block,
+            "stack_height": current_stack_height
+        }
+
+    def decide(self, observation):
+        if self.done:
+            return {"action": "wait"}
+
+        if len(observation["available_blocks"]) == 0:
+            self.done = True
+            return {"action": "wait"}
+
+        color_to_block = observation["color_to_block"]
+
+        def encode_block(block):
+            if block is None:
+                return [0.0, 0.0, 0.0, 0.0]
+            return [
+                float(block["pick_pos"][0]),
+                float(block["pick_pos"][1]),
+                float(block["pick_pos"][2]),
+                1.0
+            ]
+
+        obs_vec = np.array(
+            encode_block(color_to_block["red"]) +
+            encode_block(color_to_block["white"]) +
+            encode_block(color_to_block["blue"]) +
+            [float(observation["stack_height"])],
+            dtype=np.float32
+        )
+
+        pred_idx, pred_color, pred_probs = predict_next_cube(obs_vec)
+        chosen_block = color_to_block[pred_color]
+
+        if chosen_block is None:
+            for fallback_color in ["red", "white", "blue"]:
+                if color_to_block[fallback_color] is not None:
+                    chosen_block = color_to_block[fallback_color]
+                    pred_color = fallback_color
+                    break
+
+        if chosen_block is None:
+            self.done = True
+            return {"action": "wait"}
+
+        target_z = 0.05 + 0.06 * observation["stack_height"]
+
+        print(f"{self.name} picked {pred_color} | probs={np.round(pred_probs, 3)}")
+
+        return {
+            "action": "pick_and_place",
+            "block_id": chosen_block["id"],
+            "pick_pos": chosen_block["pick_pos"],
+            "place_pos": [self.stack_x, self.stack_y, target_z],
+            "color": pred_color,
+        }
+
+agents = [
+    LearnedRobotAgent("robot_1", robots[0], 0, platform_positions[0][0], platform_positions[0][1]),
+    LearnedRobotAgent("robot_2", robots[1], 1, platform_positions[1][0], platform_positions[1][1]),
+    LearnedRobotAgent("robot_3", robots[2], 2, platform_positions[2][0], platform_positions[2][1]),
+]
+
+stack_counts = {
+    "robot_1": 0,
+    "robot_2": 0,
+    "robot_3": 0,
+}
+
+# -------------------------
+# Run learned agents
+# -------------------------
+all_done = False
+
+while not all_done:
+    all_done = True
+
+    for agent in agents:
+        obs = agent.observe(blocks, stack_counts[agent.name])
+        action = agent.decide(obs)
+
+        if action["action"] == "wait":
+            continue
+
+        all_done = False
+
+        for b in blocks:
+            if b["id"] == action["block_id"]:
+                b["assigned"] = True
+                break
+
+        execute_pick_and_place(
+            agent.robot_id,
+            action["block_id"],
+            action["pick_pos"],
+            action["place_pos"]
+        )
+
+        for b in blocks:
+            if b["id"] == action["block_id"]:
+                b["stacked"] = True
+                break
+
+        stack_counts[agent.name] += 1
+
+step_and_capture(120, capture_every=3)
+
+video_path = "/content/learned_agent_demo.mp4"
+imageio.mimsave(video_path, frames, fps=20)
+
+Video(video_path, embed=True)
